@@ -1,6 +1,8 @@
 import os
 import glob
 import pandas as pd
+import numpy as np
+import networkx as nx
 
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, r2_score
@@ -10,6 +12,94 @@ from xgboost import XGBRegressor
 from lightgbm import LGBMRegressor
 from catboost import CatBoostRegressor
 
+
+# -------------------------------------------------------------
+# GRAF – WCZYTANIE TOPOLOGII
+# -------------------------------------------------------------
+def load_graph(path: str) -> nx.Graph:
+    """
+    Oczekiwany format:
+    line 0: liczba węzłów
+    line 1: (ignorowane)
+    dalej: macierz sąsiedztwa
+    """
+    with open(path) as f:
+        lines = f.read().strip().splitlines()
+
+    n = int(lines[0])
+    mat = np.loadtxt(lines[2:], dtype=float)
+
+    G = nx.Graph()
+    for i in range(n):
+        for j in range(i + 1, n):
+            w = mat[i, j]
+            if w > 0:
+                G.add_edge(i, j, weight=w)
+
+    return G
+
+
+def precompute_graph_stats(G: nx.Graph) -> dict:
+    return {
+        "degree": dict(G.degree()),
+        "betweenness": nx.betweenness_centrality(G, weight="weight"),
+        "closeness": nx.closeness_centrality(G, distance="weight"),
+    }
+
+
+def extract_graph_request_features(
+    df: pd.DataFrame,
+    G: nx.Graph,
+    gstats: dict,
+) -> dict:
+
+    path_lengths = []
+    hop_counts = []
+    src_deg = []
+    dst_deg = []
+    src_bet = []
+    dst_bet = []
+    max_edge_weights = []   # NEW
+
+    for _, r in df.iterrows():
+        s, d = int(r.source), int(r.destination)
+
+        try:
+            path = nx.shortest_path(G, s, d, weight="weight")
+            length = nx.shortest_path_length(G, s, d, weight="weight")
+
+            path_lengths.append(length)
+            hop_counts.append(len(path) - 1)
+
+            src_deg.append(gstats["degree"][s])
+            dst_deg.append(gstats["degree"][d])
+            src_bet.append(gstats["betweenness"][s])
+            dst_bet.append(gstats["betweenness"][d])
+
+            # -------- NEW FEATURE --------
+            edge_weights = [
+                G[path[i]][path[i + 1]]["weight"]
+                for i in range(len(path) - 1)
+            ]
+            max_edge_weights.append(max(edge_weights))
+            # --------------------------------
+
+        except nx.NetworkXNoPath:
+            continue
+
+    if not path_lengths:
+        return {}
+
+    return {
+        "spath_len_mean": np.mean(path_lengths),
+        "spath_len_std": np.std(path_lengths),
+        "hop_count_mean": np.mean(hop_counts),
+        "src_degree_mean": np.mean(src_deg),
+        "dst_degree_mean": np.mean(dst_deg),
+        "src_betweenness_mean": np.mean(src_bet),
+        "dst_betweenness_mean": np.mean(dst_bet),
+        "max_edge_weight_on_path_mean": np.mean(max_edge_weights),  # NEW
+    }
 
 # -------------------------------------------------------------
 # 1. CECHY Z requests.csv
@@ -37,7 +127,15 @@ def extract_features(df: pd.DataFrame) -> pd.Series:
 # -------------------------------------------------------------
 # 2. WCZYTANIE DANYCH JEDNEJ TOPOLOGII
 # -------------------------------------------------------------
-def load_topology(path: str, topology_name: str) -> pd.DataFrame:
+def load_topology(
+    path: str,
+    topology_name: str,
+    graph_file: str,
+) -> pd.DataFrame:
+    
+    G = load_graph(graph_file)
+    gstats = precompute_graph_stats(G)
+
     rows = []
 
     # np. RSA_estimation/Euro28/request-set_0
@@ -77,6 +175,13 @@ def load_topology(path: str, topology_name: str) -> pd.DataFrame:
 
         feat = extract_features(df_req)
 
+        graph_feats = extract_graph_request_features(df_req, G, gstats)
+        for k, v in graph_feats.items():
+            feat[k] = v
+
+        print (feat)
+
+
         target_keys = [
             "highestSlot",
             "avgHighestSlot",
@@ -99,8 +204,8 @@ def load_topology(path: str, topology_name: str) -> pd.DataFrame:
 # -------------------------------------------------------------
 base = "RSA_estimation"
 
-df_euro = load_topology(os.path.join(base, "Euro28"), "Euro28")
-df_us = load_topology(os.path.join(base, "US26"), "US26")
+df_euro = load_topology(os.path.join(base, "Euro28"), "Euro28", os.path.join(base, "Euro28", "euro28.net"))
+df_us = load_topology(os.path.join(base, "US26"), "US26", os.path.join(base, "US26", "us26.net"))
 
 data = pd.concat([df_euro, df_us], ignore_index=True)
 
